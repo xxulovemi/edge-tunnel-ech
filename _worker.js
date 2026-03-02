@@ -5,7 +5,7 @@ export { TunnelProxy };
 export default {
   async fetch(request, env, ctx) {
     try {
-      const token = '';
+      const token = 'otc';
       const upgradeHeader = request.headers.get('Upgrade');
 
       if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {

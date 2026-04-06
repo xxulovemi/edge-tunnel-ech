@@ -2,8 +2,9 @@ const DEFAULT_TOKEN = 'otc';
 const CF_FALLBACK_IPS = ['[2a00:1098:2b::1:6815:5881]'];
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
-
 const encoder = new TextEncoder();
+
+
 import { connect } from 'cloudflare:sockets';
 
 export default {
@@ -13,7 +14,9 @@ export default {
       const upgradeHeader = request.headers.get('Upgrade');
 
       if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
-        return new Response('WebSocket Proxy Server', { status: 200 });
+        return new URL(request.url).pathname === '/'
+          ? new Response('WebSocket Proxy Server', { status: 200 })
+          : new Response('Expected WebSocket', { status: 426 });
       }
 
       const clientToken = request.headers.get('Sec-WebSocket-Protocol');
@@ -69,6 +72,9 @@ async function handleSession(webSocket) {
       }
     } catch {
     } finally {
+      if (!isClosed) {
+        try { webSocket.send('CLOSE'); } catch {}
+      }
       cleanup();
     }
   };
@@ -103,14 +109,21 @@ async function handleSession(webSocket) {
       .catch(cleanup);
   });
 
+  const isCFError = (err) => {
+    const msg = err?.message?.toLowerCase() || '';
+    return msg.includes('proxy request') ||
+           msg.includes('cannot connect') ||
+           msg.includes('cloudflare');
+  };
+
   const connectToRemote = async (targetAddr, firstFrameData) => {
     const { host, port } = parseAddress(targetAddr);
     const attempts = [null, ...CF_FALLBACK_IPS];
 
-    for (const fallback of attempts) {
+    for (let i = 0; i < attempts.length; i++) {
       let tempSocket;
       try {
-        tempSocket = connect({ hostname: fallback || host, port });
+        tempSocket = connect({ hostname: attempts[i] || host, port });
         await tempSocket.opened;
 
         remoteSocket = tempSocket;
@@ -124,13 +137,13 @@ async function handleSession(webSocket) {
         webSocket.send('CONNECTED');
         pumpRemoteToWebSocket();
         return;
-      } catch {
+      } catch (err) {
         try { remoteReader?.cancel(); remoteReader?.releaseLock(); } catch {}
         try { remoteWriter?.close(); remoteWriter?.releaseLock(); } catch {}
         try { tempSocket?.close(); } catch {}
         remoteReader = remoteWriter = remoteSocket = null;
 
-        if (fallback === CF_FALLBACK_IPS[CF_FALLBACK_IPS.length - 1]) cleanup();
+        if (!isCFError(err) || i === attempts.length - 1) cleanup();
       }
     }
   };

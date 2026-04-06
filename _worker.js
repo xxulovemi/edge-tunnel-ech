@@ -1,4 +1,4 @@
-const DEFAULT_TOKEN = 'otc'; 
+const DEFAULT_TOKEN = 'otc';
 const CF_FALLBACK_IPS = ['[2a00:1098:2b::1:6815:5881]'];
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
@@ -34,7 +34,7 @@ export default {
       return new Response(null, {
         status: 101,
         webSocket: client,
-        headers: responseHeaders
+        headers: responseHeaders,
       });
     } catch (err) {
       return new Response(err.stack, { status: 500 });
@@ -50,10 +50,10 @@ async function handleSession(webSocket) {
     if (isClosed) return;
     isClosed = true;
 
-    try { remoteReader?.cancel(); } catch {}
-    try { remoteWriter?.close(); } catch {}
+    try { remoteReader?.cancel(); remoteReader?.releaseLock(); } catch {}
+    try { remoteWriter?.close(); remoteWriter?.releaseLock(); } catch {}
     try { remoteSocket?.close(); } catch {}
-    
+
     remoteReader = remoteWriter = remoteSocket = null;
     safeCloseWebSocket(webSocket);
   };
@@ -73,29 +73,34 @@ async function handleSession(webSocket) {
     }
   };
 
-  webSocket.addEventListener('message', async ({ data }) => {
+  const handleMessage = async (data) => {
     if (isClosed) return;
-    try {
-      if (data instanceof ArrayBuffer) {
-        if (remoteWriter) await remoteWriter.write(data);
-        return;
-      }
 
-      if (typeof data === 'string') {
-        if (data.startsWith('CONNECT:')) {
-          const sepIdx = data.indexOf('|', 8);
-          if (sepIdx !== -1) {
-            await connectToRemote(data.substring(8, sepIdx), data.substring(sepIdx + 1));
-          }
-        } else if (data.startsWith('DATA:')) {
-          if (remoteWriter) await remoteWriter.write(encoder.encode(data.substring(5)));
-        } else if (data === 'CLOSE') {
-          cleanup();
-        }
-      }
-    } catch {
-      cleanup();
+    if (data instanceof ArrayBuffer) {
+      if (remoteWriter) await remoteWriter.write(data);
+      return;
     }
+
+    if (typeof data === 'string') {
+      if (data.startsWith('CONNECT:')) {
+        const sepIdx = data.indexOf('|', 8);
+        if (sepIdx !== -1) {
+          await connectToRemote(data.substring(8, sepIdx), data.substring(sepIdx + 1));
+        }
+      } else if (data.startsWith('DATA:')) {
+        if (remoteWriter) await remoteWriter.write(encoder.encode(data.substring(5)));
+      } else if (data === 'CLOSE') {
+        cleanup();
+      }
+    }
+  };
+
+  let messageQueue = Promise.resolve();
+
+  webSocket.addEventListener('message', ({ data }) => {
+    messageQueue = messageQueue
+      .then(() => handleMessage(data))
+      .catch(cleanup);
   });
 
   const connectToRemote = async (targetAddr, firstFrameData) => {
@@ -103,10 +108,12 @@ async function handleSession(webSocket) {
     const attempts = [null, ...CF_FALLBACK_IPS];
 
     for (const fallback of attempts) {
+      let tempSocket;
       try {
-        remoteSocket = connect({ hostname: fallback || host, port });
-        await remoteSocket.opened;
+        tempSocket = connect({ hostname: fallback || host, port });
+        await tempSocket.opened;
 
+        remoteSocket = tempSocket;
         remoteWriter = remoteSocket.writable.getWriter();
         remoteReader = remoteSocket.readable.getReader();
 
@@ -118,9 +125,11 @@ async function handleSession(webSocket) {
         pumpRemoteToWebSocket();
         return;
       } catch {
-        try { remoteWriter?.releaseLock(); } catch {}
-        try { remoteReader?.releaseLock(); } catch {}
-        try { remoteSocket?.close(); } catch {}
+        try { remoteReader?.cancel(); remoteReader?.releaseLock(); } catch {}
+        try { remoteWriter?.close(); remoteWriter?.releaseLock(); } catch {}
+        try { tempSocket?.close(); } catch {}
+        remoteReader = remoteWriter = remoteSocket = null;
+
         if (fallback === CF_FALLBACK_IPS[CF_FALLBACK_IPS.length - 1]) cleanup();
       }
     }

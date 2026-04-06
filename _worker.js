@@ -42,6 +42,7 @@ export default {
 
 async function handleSession(webSocket) {
   let remoteSocket, remoteWriter, remoteReader;
+  let isConnecting = false;
   let isClosed = false;
 
   const cleanup = () => {
@@ -50,7 +51,6 @@ async function handleSession(webSocket) {
 
     try { remoteReader?.cancel(); }      catch {}
     try { remoteWriter?.releaseLock(); } catch {}
-    try { remoteWriter?.close(); }       catch {}
     try { remoteSocket?.close(); }       catch {}
 
     remoteReader = remoteWriter = remoteSocket = null;
@@ -58,14 +58,21 @@ async function handleSession(webSocket) {
   };
 
   const pumpRemoteToWebSocket = async () => {
+    let chunkBuf = new ArrayBuffer(65536);
+    const reader = remoteReader;
+
     try {
-      while (!isClosed && remoteReader) {
-        const { done, value } = await remoteReader.read();
+      while (!isClosed) {
+        const { done, value } = await reader.read(new Uint8Array(chunkBuf));
         if (done || isClosed) break;
         if (webSocket.readyState !== WS_READY_STATE_OPEN) break;
-        if (value?.byteLength > 0) webSocket.send(value);
+        chunkBuf = value.buffer;
+        if (value.byteLength > 0) webSocket.send(value.slice());
       }
     } catch {}
+
+    try { reader.releaseLock(); } catch {}
+    remoteReader = null;
 
     if (!isClosed) {
       try { webSocket.send('CLOSE'); } catch {}
@@ -73,41 +80,42 @@ async function handleSession(webSocket) {
     }
   };
 
-  const isCFError = (err) => {
-    const msg = err?.message?.toLowerCase() ?? '';
-    return msg.includes('proxy request') ||
-           msg.includes('cannot connect') ||
-           msg.includes('cloudflare');
-  };
-
   const connectToRemote = async (targetAddr, firstFrameData) => {
+    if (isConnecting || remoteSocket) return;
+    isConnecting = true;
+
     const { host, port } = parseAddress(targetAddr);
-    const attempts = [null, ...CF_FALLBACK_IPS];
+    const attempts = [host, ...CF_FALLBACK_IPS.map(ip => ip.slice(1, -1))];
 
     for (let i = 0; i < attempts.length; i++) {
+      let socket, writer, reader;
       try {
-        remoteSocket = connect({ hostname: attempts[i] ?? host, port });
-        await remoteSocket.opened;
+        socket = connect({ hostname: attempts[i], port });
+        await socket.opened;
 
-        remoteWriter = remoteSocket.writable.getWriter();
-        remoteReader = remoteSocket.readable.getReader();
+        writer = socket.writable.getWriter();
+        reader = socket.readable.getReader({ mode: 'byob' });
 
         if (firstFrameData) {
-          await remoteWriter.write(encoder.encode(firstFrameData));
+          await writer.write(encoder.encode(firstFrameData));
         }
 
+        remoteSocket = socket;
+        remoteWriter = writer;
+        remoteReader = reader;
+
         webSocket.send('CONNECTED');
+        isConnecting = false;
         pumpRemoteToWebSocket();
         return;
-      } catch (err) {
-        try { remoteReader?.cancel(); }      catch {}
-        try { remoteWriter?.releaseLock(); } catch {}
-        try { remoteSocket?.close(); }       catch {}
-        remoteReader = remoteWriter = remoteSocket = null;
+      } catch {
+        try { reader?.cancel(); }      catch {}
+        try { writer?.releaseLock(); } catch {}
+        try { socket?.close(); }       catch {}
 
-        if (!isCFError(err) || i === attempts.length - 1) {
+        if (i === attempts.length - 1) {
+          isConnecting = false;
           cleanup();
-          return;
         }
       }
     }

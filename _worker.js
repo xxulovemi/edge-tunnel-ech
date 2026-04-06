@@ -49,14 +49,16 @@ async function handleSession(webSocket) {
   const cleanup = () => {
     if (isClosed) return;
     isClosed = true;
+
     try { remoteReader?.cancel(); } catch {}
     try { remoteWriter?.close(); } catch {}
     try { remoteSocket?.close(); } catch {}
+    
     remoteReader = remoteWriter = remoteSocket = null;
     safeCloseWebSocket(webSocket);
   };
 
-  const pumpRemote = async () => {
+  const pumpRemoteToWebSocket = async () => {
     try {
       while (!isClosed && remoteReader) {
         const { done, value } = await remoteReader.read();
@@ -78,6 +80,7 @@ async function handleSession(webSocket) {
         if (remoteWriter) await remoteWriter.write(data);
         return;
       }
+
       if (typeof data === 'string') {
         if (data.startsWith('CONNECT:')) {
           const sepIdx = data.indexOf('|', 8);
@@ -97,39 +100,29 @@ async function handleSession(webSocket) {
 
   const connectToRemote = async (targetAddr, firstFrameData) => {
     const { host, port } = parseAddress(targetAddr);
-    const connectionPool = [];
+    const attempts = [null, ...CF_FALLBACK_IPS];
 
-    const tryConnect = async (targetHost, delay = 0) => {
-      if (delay > 0) await new Promise(r => setTimeout(r, delay));
-      const socket = connect({ hostname: targetHost, port });
-      connectionPool.push(socket);
-      await socket.opened;
-      return socket;
-    };
+    for (const fallback of attempts) {
+      try {
+        remoteSocket = connect({ hostname: fallback || host, port });
+        await remoteSocket.opened;
 
-    try {
-      const promises = [tryConnect(host, 0)];
-      for (const ip of CF_FALLBACK_IPS) {
-        promises.push(tryConnect(ip, 250));
+        remoteWriter = remoteSocket.writable.getWriter();
+        remoteReader = remoteSocket.readable.getReader();
+
+        if (firstFrameData) {
+          await remoteWriter.write(encoder.encode(firstFrameData));
+        }
+
+        webSocket.send('CONNECTED');
+        pumpRemoteToWebSocket();
+        return;
+      } catch {
+        try { remoteWriter?.releaseLock(); } catch {}
+        try { remoteReader?.releaseLock(); } catch {}
+        try { remoteSocket?.close(); } catch {}
+        if (fallback === CF_FALLBACK_IPS[CF_FALLBACK_IPS.length - 1]) cleanup();
       }
-
-      remoteSocket = await Promise.any(promises);
-
-      connectionPool.forEach(s => {
-        if (s !== remoteSocket) try { s.close(); } catch {}
-      });
-
-      remoteWriter = remoteSocket.writable.getWriter();
-      remoteReader = remoteSocket.readable.getReader();
-
-      if (firstFrameData) {
-        await remoteWriter.write(encoder.encode(firstFrameData));
-      }
-
-      webSocket.send('CONNECTED');
-      pumpRemote();
-    } catch {
-      cleanup();
     }
   };
 

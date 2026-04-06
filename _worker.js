@@ -1,7 +1,8 @@
 const DEFAULT_TOKEN = 'otc';
-const CF_FALLBACK_IPS = ['[2a00:1098:2b::1:6815:5881]'];
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
+const CF_FALLBACK_IPS = ['2a00:1098:2b::1:6815:5881'];
+
 const encoder = new TextEncoder();
 
 import { connect } from 'cloudflare:sockets';
@@ -34,6 +35,7 @@ export default {
       }
 
       return new Response(null, responseInit);
+
     } catch (err) {
       return new Response(err.toString(), { status: 500 });
     }
@@ -41,38 +43,43 @@ export default {
 };
 
 async function handleSession(webSocket) {
-  let remoteSocket, remoteWriter, remoteReader;
-  let isConnecting = false;
+  let remoteSocket = null;
+  let remoteWriter = null;
+  let remoteReader = null;
+
   let isClosed = false;
+  let isConnecting = false;
 
   const cleanup = () => {
     if (isClosed) return;
     isClosed = true;
 
-    try { remoteReader?.cancel(); }      catch {}
+    try { remoteReader?.cancel(); } catch {}
     try { remoteWriter?.releaseLock(); } catch {}
-    try { remoteSocket?.close(); }       catch {}
+    try { remoteSocket?.close(); } catch {}
 
     remoteReader = remoteWriter = remoteSocket = null;
+
     safeCloseWebSocket(webSocket);
   };
 
   const pumpRemoteToWebSocket = async () => {
     let chunkBuf = new ArrayBuffer(65536);
-    const reader = remoteReader;
 
     try {
-      while (!isClosed) {
-        const { done, value } = await reader.read(new Uint8Array(chunkBuf));
-        if (done || isClosed) break;
+      while (!isClosed && remoteReader) {
+        const { done, value } = await remoteReader.read(new Uint8Array(chunkBuf));
+
+        if (done) break;
         if (webSocket.readyState !== WS_READY_STATE_OPEN) break;
+
         chunkBuf = value.buffer;
-        if (value.byteLength > 0) webSocket.send(value.slice());
+
+        if (value.byteLength > 0) {
+          webSocket.send(value.slice());
+        }
       }
     } catch {}
-
-    try { reader.releaseLock(); } catch {}
-    remoteReader = null;
 
     if (!isClosed) {
       try { webSocket.send('CLOSE'); } catch {}
@@ -80,21 +87,58 @@ async function handleSession(webSocket) {
     }
   };
 
+  const parseAddress = (addr) => {
+    if (!addr) return null;
+
+    if (addr[0] === '[') {
+      const end = addr.indexOf(']');
+      if (end === -1) return null;
+
+      return {
+        host: addr.substring(1, end),
+        port: parseInt(addr.substring(end + 2), 10)
+      };
+    }
+
+    const sep = addr.lastIndexOf(':');
+    if (sep === -1) return null;
+
+    return {
+      host: addr.substring(0, sep),
+      port: parseInt(addr.substring(sep + 1), 10)
+    };
+  };
+
+  const isCFError = (err) => {
+    const msg = err?.message?.toLowerCase() || '';
+    return msg.includes('proxy') ||
+           msg.includes('cloudflare') ||
+           msg.includes('connect');
+  };
+
   const connectToRemote = async (targetAddr, firstFrameData) => {
     if (isConnecting || remoteSocket) return;
     isConnecting = true;
 
-    const { host, port } = parseAddress(targetAddr);
-    const attempts = [host, ...CF_FALLBACK_IPS.map(ip => ip.slice(1, -1))];
+    const parsed = parseAddress(targetAddr);
+    if (!parsed) {
+      isConnecting = false;
+      return cleanup();
+    }
+
+    const { host, port } = parsed;
+
+    const attempts = [host, ...CF_FALLBACK_IPS];
 
     for (let i = 0; i < attempts.length; i++) {
-      let socket, writer, reader;
       try {
-        socket = connect({ hostname: attempts[i], port });
+        const hostname = attempts[i];
+
+        const socket = connect({ hostname, port });
         await socket.opened;
 
-        writer = socket.writable.getWriter();
-        reader = socket.readable.getReader({ mode: 'byob' });
+        const writer = socket.writable.getWriter();
+        const reader = socket.readable.getReader({ mode: 'byob' });
 
         if (firstFrameData) {
           await writer.write(encoder.encode(firstFrameData));
@@ -105,17 +149,27 @@ async function handleSession(webSocket) {
         remoteReader = reader;
 
         webSocket.send('CONNECTED');
+
         isConnecting = false;
+
         pumpRemoteToWebSocket();
         return;
-      } catch {
-        try { reader?.cancel(); }      catch {}
-        try { writer?.releaseLock(); } catch {}
-        try { socket?.close(); }       catch {}
+
+      } catch (err) {
+        try { remoteReader?.cancel(); } catch {}
+        try { remoteWriter?.releaseLock(); } catch {}
+        try { remoteSocket?.close(); } catch {}
+
+        remoteReader = remoteWriter = remoteSocket = null;
+
+        if (!isCFError(err) && i === 0) {
+          isConnecting = false;
+          return cleanup();
+        }
 
         if (i === attempts.length - 1) {
           isConnecting = false;
-          cleanup();
+          return cleanup();
         }
       }
     }
@@ -123,21 +177,36 @@ async function handleSession(webSocket) {
 
   webSocket.addEventListener('message', async ({ data }) => {
     if (isClosed) return;
+
     try {
       if (typeof data === 'string') {
+
         if (data.startsWith('CONNECT:')) {
           const sep = data.indexOf('|', 8);
-          if (sep !== -1) {
-            await connectToRemote(data.substring(8, sep), data.substring(sep + 1));
+          if (sep === -1) return;
+
+          await connectToRemote(
+            data.substring(8, sep),
+            data.substring(sep + 1)
+          );
+        }
+
+        else if (data.startsWith('DATA:')) {
+          if (remoteWriter) {
+            await remoteWriter.write(
+              encoder.encode(data.substring(5))
+            );
           }
-        } else if (data.startsWith('DATA:')) {
-          if (remoteWriter) await remoteWriter.write(encoder.encode(data.substring(5)));
-        } else if (data === 'CLOSE') {
+        }
+
+        else if (data === 'CLOSE') {
           cleanup();
         }
+
       } else if (data instanceof ArrayBuffer && remoteWriter) {
         await remoteWriter.write(new Uint8Array(data));
       }
+
     } catch (err) {
       try { webSocket.send('ERROR:' + err.message); } catch {}
       cleanup();
@@ -146,15 +215,6 @@ async function handleSession(webSocket) {
 
   webSocket.addEventListener('close', cleanup);
   webSocket.addEventListener('error', cleanup);
-}
-
-function parseAddress(addr) {
-  if (addr.startsWith('[')) {
-    const end = addr.indexOf(']');
-    return { host: addr.substring(1, end), port: parseInt(addr.substring(end + 2), 10) };
-  }
-  const sep = addr.lastIndexOf(':');
-  return { host: addr.substring(0, sep), port: parseInt(addr.substring(sep + 1), 10) };
 }
 
 function safeCloseWebSocket(ws) {

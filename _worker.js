@@ -1,6 +1,6 @@
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
-const CF_FALLBACK_IPS = [2a00:1098:2b::1:6815:5881]:443;  // 支持端口格式：[IPv6]:端口 或 IP:端口
+const CF_FALLBACK_IPS = [''];  // 支持端口格式：[IPv6]:端口 或 IP:端口
 
 // 复用 TextEncoder，避免重复创建
 const encoder = new TextEncoder();

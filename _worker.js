@@ -12,7 +12,7 @@ export default {
     try {
       const url = new URL(request.url);
       const fallback = url.searchParams.get('fallback');
-      const token = '';
+      const token = 'xxulovemi';
       const upgradeHeader = request.headers.get('Upgrade');
       
       if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {

@@ -14,7 +14,7 @@ export default {
 
       if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
         return new URL(request.url).pathname === '/'
-          ? new Response('WebSocket Proxy Server', { status: 200 })
+          ? new Response('WebSocket Server', { status: 200 })
           : new Response('Expected WebSocket', { status: 426 });
       }
 

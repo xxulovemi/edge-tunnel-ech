@@ -82,18 +82,32 @@ async function handleSession(webSocket, dynamicFallback) {
   };
 
   const parseAddress = (addr) => {
+    // 处理 [IPv6]:端口 格式
     if (addr[0] === '[') {
       const end = addr.indexOf(']');
-      return {
-        host: addr.substring(1, end),
-        port: parseInt(addr.substring(end + 2), 10)
-      };
+      if (end === -1) {
+        throw new Error(`无效的地址格式，缺少结束括号 ']': ${addr}`);
+      }
+      const host = addr.substring(1, end);
+      const portStr = addr.substring(end + 2);
+      const port = parseInt(portStr, 10);
+      if (isNaN(port) || port < 1 || port > 65535) {
+        throw new Error(`地址中的端口无效: ${addr}`);
+      }
+      return { host, port };
     }
+    
+    // 处理 主机:端口 格式（主机名或 IPv4）
     const sep = addr.lastIndexOf(':');
-    return {
-      host: addr.substring(0, sep),
-      port: parseInt(addr.substring(sep + 1), 10)
-    };
+    if (sep === -1) {
+      throw new Error(`无效的地址格式，缺少端口: ${addr}`);
+    }
+    const host = addr.substring(0, sep);
+    const port = parseInt(addr.substring(sep + 1), 10);
+    if (isNaN(port) || port < 1 || port > 65535) {
+      throw new Error(`地址中的端口无效: ${addr}`);
+    }
+    return { host, port };
   };
 
   const isCFError = (err) => {
